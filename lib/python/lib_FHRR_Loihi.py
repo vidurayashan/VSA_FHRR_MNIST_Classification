@@ -16,11 +16,39 @@ from lava.magma.core.process.ports.ports import InPort, OutPort
 # In[2]:
 
 
+# import numpy as np
+# from sklearn.datasets import fetch_openml
+# from scipy.fftpack import fft
+# from sklearn.preprocessing import normalize
+# from sklearn.model_selection import train_test_split
+# from sklearn.metrics import accuracy_score
+# from sklearn.neighbors import KNeighborsClassifier
+# from sklearn.metrics import confusion_matrix, f1_score
+# import seaborn as sns
+# import matplotlib.pyplot as plt
+# from sklearn.metrics import classification_report
+# from tqdm import tqdm
+# import math
+# from sklearn.metrics.pairwise import cosine_similarity
+# import scienceplots
+# import matplotlib as mpl
+# from copy import deepcopy
+# mpl.rcParams['figure.dpi'] = 300
+# # import lib.python.lib_FHRR_Loihi as lib
+# # import lib.python.utility as util
+# from lava.magma.core.run_configs import Loihi1SimCfg
+# from lava.magma.core.run_configs import Loihi2HwCfg
+# from lava.magma.core.run_conditions import RunSteps
+
+
+# In[3]:
+
+
 # import nbimporter
 import lib.python.utility as util
 
 
-# In[3]:
+# In[4]:
 
 
 class GlobalVars():
@@ -42,7 +70,7 @@ def set_params_manual(v_th, time_steps):
     GlobalVars.time_steps       = time_steps
 
 
-# In[4]:
+# In[5]:
 
 
 '''
@@ -77,6 +105,28 @@ class FHRR_Encoder(AbstractProcess):
     def get_v(self):
         return self.v.get()
 
+'''
+Function to encode real vectors in latency encoding
+'''
+class FHRR_Encoder_Latency(AbstractProcess):
+    def __init__(self, vec, sim_time=1, phase=1):
+        super().__init__()
+        hd_vec = vec
+        shape = (len(hd_vec),)
+        self.spikes_out = OutPort(shape=shape)  # Input spikes to the classifier
+        self.input_vec = Var(shape=shape, init=hd_vec)
+        self.v = Var(shape=shape, init=0)
+        self.vth = Var(shape=(1,), init=GlobalVars.global_threshold)
+        self.sim_time = Var(shape=(1,), init=sim_time)
+        self.is_spike = Var(shape=shape, init=0)
+        self.phase    = Var(shape=(1,), init=phase)
+        
+    def get_v(self):
+        return self.v.get()
+
+    def get_is_spike(self):
+        return self.is_spike.get()
+
 class FHRR_Decoder(AbstractProcess):
 
     def __init__(self, dimension : int):
@@ -90,12 +140,19 @@ class FHRR_Decoder(AbstractProcess):
         
         self.a_last_spk = Var(shape=shape, init=0)
         self.a_period = Var(shape=shape, init=GlobalVars.global_max)
+        self.spike_count = Var(shape=shape, init=0)
         
     def get_v(self):
         return self.v.get()
     
     def get_decoded_value(self):
         return self.decoded_a.get()
+
+    def get_spike_period(self):
+        return self.a_period.get()
+
+    def get_spike_count(self):
+        return self.spike_count.get()
 
 class FHRR_Decoder_Rate(AbstractProcess):
 
@@ -166,7 +223,7 @@ class FHRR_Multiply(AbstractProcess):
         return self.v.get()
 
 
-# In[5]:
+# In[6]:
 
 
 import numpy as np
@@ -207,6 +264,49 @@ class PySpikeInputModel(PyLoihiProcessModel):
         """
         self.v[:] = self.v + self.input_vec
         s_out = self.v > self.vth
+        self.v[s_out] = 0  # reset voltage to 0 after a spike
+        self.spikes_out.send(s_out)
+
+
+@implements(proc=FHRR_Encoder_Latency, protocol=LoihiProtocol)
+@requires(Loihi2NeuroCore)
+class PySpikeInputModelLatency(PyLoihiProcessModel):
+    spikes_out: PyOutPort = LavaPyType(PyOutPort.VEC_DENSE, bool, precision=1)
+    input_vec: np.ndarray = LavaPyType(np.ndarray, float, precision=32)
+    v: np.ndarray = LavaPyType(np.ndarray, int, precision=32)
+    vth: int = LavaPyType(int, int, precision=32)
+    sim_time: int = LavaPyType(int, int, precision=32)
+    is_spike: np.ndarray = LavaPyType(np.ndarray, int, precision=32)
+    phase: int = LavaPyType(int, int, precision=32)
+    
+    
+    def __init__(self, proc_params):
+        super().__init__(proc_params)
+        self.time_step = 0
+
+    def post_guard(self):
+        """Guard function for PostManagement phase.
+        """
+        if self.time_step == 1:
+            return True
+        return False
+
+    def run_post_mgmt(self):
+        """Post-Management phase: executed only when guard function above 
+        returns True.
+        """
+        self.v = np.zeros(self.v.shape)
+
+    def run_spk(self):
+        """Spiking phase: executed unconditionally at every time-step
+        """
+        self.v[:] = self.v + self.input_vec
+        s_out = self.v > self.vth
+
+        s_out = s_out > self.is_spike
+
+        self.is_spike = s_out + self.is_spike
+        
         self.v[s_out] = 0  # reset voltage to 0 after a spike
         self.spikes_out.send(s_out)
 
@@ -386,7 +486,7 @@ class PySpikeMultModel(PyLoihiProcessModel):
         
 
 
-# In[6]:
+# In[7]:
 
 
 @implements(proc=FHRR_Decoder, protocol=LoihiProtocol)
@@ -399,6 +499,7 @@ class PySpikeDecoderModel(PyLoihiProcessModel):
 
     a_last_spk: np.ndarray = LavaPyType(np.ndarray, int, precision=32)
     a_period: np.ndarray = LavaPyType(np.ndarray, float, precision=32)
+    spike_count: np.ndarray = LavaPyType(np.ndarray, float, precision=32)
     
     def __init__(self, proc_params):
         super().__init__(proc_params)
@@ -440,6 +541,8 @@ class PySpikeDecoderModel(PyLoihiProcessModel):
         self.decoded_a = self.vth / self.a_period
         # print(f"decoded_val         : {[item * 180 / cmath.pi for item in self.decoded_a]}")
         # print(f'a_period            : {self.a_period}')
+
+        self.spike_count[:] += new_spikes
         
         self.v[:] = self.v + self.decoded_a
         s_out = self.v > self.vth
@@ -447,7 +550,7 @@ class PySpikeDecoderModel(PyLoihiProcessModel):
         
 
 
-# In[ ]:
+# In[8]:
 
 
 @implements(proc=FHRR_Decoder_Rate, protocol=LoihiProtocol)
@@ -509,4 +612,44 @@ class PySpikeDecoderRateModel(PyLoihiProcessModel):
         s_out = self.v > self.vth
         self.v[s_out] = 0
         
+
+
+# In[ ]:
+
+
+
+
+
+# In[9]:
+
+
+# rv1 = np.random.uniform(0, 2 * np.pi, 10)
+# time_steps = 20
+
+
+# In[ ]:
+
+
+# encoder  = FHRR_Encoder(vec = rv1)
+# decoder  = FHRR_Decoder(dimension=rv1.shape[0])
+
+# encoder.spikes_out.connect(decoder.spikes_a_in)
+
+# decoder.run(condition=RunSteps(num_steps=time_steps), run_cfg=Loihi1SimCfg())
+
+# raw_rslt  = decoder.get_decoded_value()
+
+# # for i in range(time_steps):
+# #     print(i)
+# #     decoder.run(condition=RunSteps(num_steps=1), run_cfg=Loihi1SimCfg())
+# #     # is_spike = encoder.get_is_spike()
+# #     # print(is_spike)
+
+# decoder.stop()
+
+
+# In[ ]:
+
+
+
 
