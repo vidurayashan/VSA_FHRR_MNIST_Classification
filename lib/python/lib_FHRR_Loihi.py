@@ -221,6 +221,26 @@ class FHRR_Multiply(AbstractProcess):
         
     def get_v(self):
         return self.v.get()
+    
+class FHRR_Multiply_Reverse(AbstractProcess):
+
+    def __init__(self, dimension : int):
+        super().__init__()
+        self.dim = Var(shape=(1,), init=dimension)
+        shape = (dimension,)
+        self.spikes_a_in = InPort(shape=shape)
+        self.spikes_b_in = InPort(shape=shape)
+        self.spikes_out = OutPort(shape=shape)
+        self.v = Var(shape=shape, init=0)
+        self.vth = Var(shape=(1,), init=GlobalVars.global_threshold)
+        
+        self.a_last_spk = Var(shape=shape, init=0)
+        self.b_last_spk = Var(shape=shape, init=0)
+        self.a_period = Var(shape=shape, init=GlobalVars.global_max)
+        self.b_period = Var(shape=shape, init=GlobalVars.global_max)
+        
+    def get_v(self):
+        return self.v.get()
 
 
 # In[6]:
@@ -474,6 +494,92 @@ class PySpikeMultModel(PyLoihiProcessModel):
 #         print(f"decoded_b         : {[item * 180 / cmath.pi for item in decoded_b]}")
         
         mult_phase = [a + b for a,b in zip(decoded_a, decoded_b)]
+        
+        mult_phase_cleaned = util.cleanphase(mult_phase)
+        
+#         print(f"mult_phase_cleaned         : {[item * 180 / cmath.pi for item in mult_phase_cleaned]}")
+        
+        self.v[:] = self.v + mult_phase_cleaned
+        s_out = self.v > self.vth
+        self.v[s_out] = 0
+        self.spikes_out.send(s_out)
+        
+
+@implements(proc=FHRR_Multiply_Reverse, protocol=LoihiProtocol)
+@requires(Loihi2NeuroCore)
+class PySpikeMultReverseModel(PyLoihiProcessModel):   
+    dim: int = LavaPyType(int, int, precision=32)
+    spikes_a_in: PyInPort = LavaPyType(PyInPort.VEC_DENSE, bool, precision=1)
+    spikes_b_in: PyInPort = LavaPyType(PyInPort.VEC_DENSE, bool, precision=1)    
+    spikes_out: PyOutPort = LavaPyType(PyOutPort.VEC_DENSE, bool, precision=1)
+    v: np.ndarray = LavaPyType(np.ndarray, float, precision=32)
+    vth: int = LavaPyType(int, int, precision=32)
+    
+
+    a_last_spk: np.ndarray = LavaPyType(np.ndarray, int, precision=32)
+    b_last_spk: np.ndarray = LavaPyType(np.ndarray, int, precision=32)
+    a_period: np.ndarray = LavaPyType(np.ndarray, float, precision=32)
+    b_period: np.ndarray = LavaPyType(np.ndarray, float, precision=32)
+    
+    def __init__(self, proc_params):
+        super().__init__(proc_params)
+        self.time_step = 0
+
+    def post_guard(self):
+        """Guard function for PostManagement phase.
+        """
+        if self.time_step == 1:
+            return True
+        return False
+
+    def run_post_mgmt(self):
+        """Post-Management phase: executed only when guard function above 
+        returns True.
+        """
+        self.v          = np.zeros((self.v.shape))
+        self.a_last_spk = np.zeros((self.v.shape))
+        self.b_last_spk = np.zeros((self.v.shape))
+
+
+    def run_spk(self):
+        """Spiking phase: executed unconditionally at every time-step
+        """
+#         print(f"time : {self.time_step}")
+        vec_time_step = np.full((self.v.shape), self.time_step)
+        
+        new_spike_times = self.spikes_a_in.peek() * vec_time_step 
+        new_spikes      = (new_spike_times > 0) * 1
+        new_spikes_inv  = 1 - (new_spikes > 0)
+        
+        masked_last_spike = self.a_last_spk * new_spikes
+        self.a_period[:] = (new_spike_times - masked_last_spike) + new_spikes_inv * self.a_period
+        
+
+        masked_last_spike_inv = self.a_last_spk * new_spikes_inv
+        self.a_last_spk = masked_last_spike_inv + new_spikes * vec_time_step
+        
+        decoded_a = GlobalVars.global_threshold / self.a_period
+        
+        ###############################################################################
+        
+        new_spike_times = self.spikes_b_in.peek() * vec_time_step 
+        new_spikes      = (new_spike_times > 0) * 1
+        new_spikes_inv  = 1 - (new_spikes > 0)
+        
+        masked_last_spike = self.b_last_spk * new_spikes
+        self.b_period[:] = (new_spike_times - masked_last_spike) + new_spikes_inv * self.b_period
+        
+        masked_last_spike_inv = self.b_last_spk * new_spikes_inv
+        self.b_last_spk = masked_last_spike_inv + new_spikes * vec_time_step
+        
+        decoded_b = GlobalVars.global_threshold / self.b_period
+        
+        ##############################################################################################
+        
+#         print(f"decoded_a         : {[item * 180 / cmath.pi for item in decoded_a]}")
+#         print(f"decoded_b         : {[item * 180 / cmath.pi for item in decoded_b]}")
+        
+        mult_phase = [a - b for a,b in zip(decoded_a, decoded_b)]
         
         mult_phase_cleaned = util.cleanphase(mult_phase)
         
